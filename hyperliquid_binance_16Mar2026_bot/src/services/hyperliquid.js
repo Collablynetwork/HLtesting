@@ -10,6 +10,59 @@ const TRANSPORT_URL = CONFIG.hyperliquid.testnet
   ? 'https://api.hyperliquid-testnet.xyz'
   : 'https://api.hyperliquid.xyz';
 
+function toNum(v) {
+  if (v === null || v === undefined || v === '') return NaN;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+async function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetriableError(err) {
+  const status = err?.response?.status;
+  const code = String(err?.code || '').toUpperCase();
+  const msg = String(err?.message || '').toLowerCase();
+
+  return (
+    status === 429 ||
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    code === 'ECONNRESET' ||
+    code === 'ECONNABORTED' ||
+    code === 'ETIMEDOUT' ||
+    code === 'EAI_AGAIN' ||
+    code === 'ENOTFOUND' ||
+    msg.includes('eai_again') ||
+    msg.includes('getaddrinfo') ||
+    msg.includes('temporary failure in name resolution') ||
+    msg.includes('timeout') ||
+    msg.includes('network') ||
+    msg.includes('socket hang up')
+  );
+}
+
+async function withRetry(fn, { retries = 5, baseDelayMs = 800, maxDelayMs = 7000 } = {}) {
+  let lastErr;
+
+  for (let i = 0; i <= retries; i += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isRetriableError(err) || i === retries) throw err;
+      const jitterMs = Math.floor(Math.random() * 250);
+      const delayMs = Math.min(baseDelayMs * (2 ** i) + jitterMs, maxDelayMs);
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastErr;
+}
+
 export class HyperliquidService {
   constructor() {
     if (!CONFIG.hyperliquid.privateKey) {
@@ -21,7 +74,10 @@ export class HyperliquidService {
     }
 
     this.infoUrl = CONFIG.hyperliquid.testnet ? TESTNET_INFO_URL : MAINNET_INFO_URL;
-    this.http = axios.create({ timeout: 15000 });
+    this.http = axios.create({
+      timeout: Math.max(5000, Number(CONFIG.hyperliquid.timeoutMs || 15000)),
+      headers: { 'Content-Type': 'application/json' }
+    });
     this.transport = new HttpTransport({ url: TRANSPORT_URL });
     this.wallet = privateKeyToAccount(CONFIG.hyperliquid.privateKey);
     this.exchange = new ExchangeClient({ transport: this.transport, wallet: this.wallet });
@@ -30,10 +86,10 @@ export class HyperliquidService {
   }
 
   async postInfo(body) {
-    const { data } = await this.http.post(this.infoUrl, body, {
-      headers: { 'Content-Type': 'application/json' }
+    return withRetry(async () => {
+      const { data } = await this.http.post(this.infoUrl, body);
+      return data;
     });
-    return data;
   }
 
   async init() {
@@ -63,11 +119,51 @@ export class HyperliquidService {
     return stripTrailingZeros(rounded);
   }
 
-  roundPrice(coin, price) {
+  roundPrice(coin, price, mode = 'nearest') {
     const { szDecimals } = this.getAssetInfo(coin);
     const maxDecimals = Math.max(0, 6 - szDecimals);
-    const rounded = clampNumber(price).toFixed(maxDecimals);
-    return stripTrailingZeros(rounded);
+
+    let n = clampNumber(price);
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new Error(`Invalid raw price for ${coin}`);
+    }
+
+    if (Number.isInteger(n)) {
+      return String(Math.trunc(n));
+    }
+
+    // Hyperliquid perp price rule: <= 5 significant figures and <= (6 - szDecimals) decimals.
+    n = Number(n.toPrecision(5));
+
+    const factor = 10 ** maxDecimals;
+    const scaled = n * factor;
+    let adjusted;
+
+    if (mode === 'up') {
+      adjusted = Math.ceil(scaled - 1e-12) / factor;
+    } else if (mode === 'down') {
+      adjusted = Math.floor(scaled + 1e-12) / factor;
+    } else {
+      adjusted = Math.round(scaled) / factor;
+    }
+
+    if (!Number.isFinite(adjusted) || adjusted <= 0) {
+      adjusted = Math.max(1 / factor, Number(n.toFixed(maxDecimals)));
+    }
+
+    if (!Number.isInteger(adjusted)) {
+      adjusted = Number(adjusted.toPrecision(5));
+      const rescaled = adjusted * factor;
+      if (mode === 'up') {
+        adjusted = Math.ceil(rescaled - 1e-12) / factor;
+      } else if (mode === 'down') {
+        adjusted = Math.floor(rescaled + 1e-12) / factor;
+      } else {
+        adjusted = Math.round(rescaled) / factor;
+      }
+    }
+
+    return stripTrailingZeros(adjusted.toFixed(maxDecimals));
   }
 
   async allMids() {
@@ -80,16 +176,48 @@ export class HyperliquidService {
     if (value == null) {
       throw new Error(`Mid price unavailable for ${coin}`);
     }
-    return Number(value);
+
+    const mid = Number(value);
+    if (!Number.isFinite(mid) || mid <= 0) {
+      throw new Error(`Invalid mid price for ${coin}`);
+    }
+
+    return mid;
   }
 
   async getUserState() {
     return this.postInfo({ type: 'clearinghouseState', user: this.walletAddress });
   }
 
+  extractAvailableBalance(userState) {
+    const candidates = [
+      userState?.withdrawable,
+      userState?.marginSummary?.withdrawable,
+      userState?.crossMarginSummary?.withdrawable,
+      userState?.marginSummary?.accountValue,
+      userState?.crossMarginSummary?.accountValue
+    ];
+
+    for (const candidate of candidates) {
+      const n = toNum(candidate);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+
+    return NaN;
+  }
+
   async getWithdrawableBalance() {
     const state = await this.getUserState();
-    return Number(state?.withdrawable || 0);
+    const available = this.extractAvailableBalance(state);
+
+    if (!Number.isFinite(available) || available <= 0) {
+      throw new Error(
+        'Invalid available balance for size calculation. ' +
+        'Check HYPERLIQUID_MAIN_ADDRESS, wallet funding, and account mode.'
+      );
+    }
+
+    return available;
   }
 
   async getPosition(coin) {
@@ -126,36 +254,74 @@ export class HyperliquidService {
     }) || null;
   }
 
-  async updateLeverage(coin, leverage) {
+  async updateLeverage(coin, requestedLeverage) {
     const { asset } = this.getAssetInfo(coin);
-    return this.exchange.updateLeverage({
-      asset,
-      isCross: true,
-      leverage
+
+    const leverage = Number(requestedLeverage);
+    if (!Number.isInteger(leverage) || leverage < 1) {
+      throw new Error(`Invalid leverage value: ${requestedLeverage}`);
+    }
+
+    return withRetry(async () => {
+      return this.exchange.updateLeverage({
+        asset,
+        isCross: true,
+        leverage
+      });
     });
   }
 
   async placeLimitOrder({ coin, side, size, price, reduceOnly = false, tif = 'Gtc', cloid }) {
     const { asset } = this.getAssetInfo(coin);
 
-    return this.exchange.order({
-      orders: [{
-        a: asset,
-        b: side === 'LONG',
-        p: this.roundPrice(coin, price),
-        s: this.roundSize(coin, size),
-        r: reduceOnly,
-        t: { limit: { tif } },
-        ...(cloid ? { c: cloid } : {})
-      }],
-      grouping: 'na'
-    });
+    const sideMode = side === 'LONG' ? 'up' : 'down';
+    const roundedPrice = this.roundPrice(coin, price, sideMode);
+    const roundedSize = this.roundSize(coin, size);
+
+    if (!roundedPrice || Number(roundedPrice) <= 0) {
+      throw new Error(`Invalid rounded price for ${coin}`);
+    }
+
+    if (!roundedSize || Number(roundedSize) <= 0) {
+      throw new Error(`Invalid rounded size for ${coin}`);
+    }
+
+    const submit = (px) => {
+      return this.exchange.order({
+        orders: [{
+          a: asset,
+          b: side === 'LONG',
+          p: px,
+          s: roundedSize,
+          r: reduceOnly,
+          t: { limit: { tif } },
+          ...(cloid ? { c: cloid } : {})
+        }],
+        grouping: 'na'
+      });
+    };
+
+    try {
+      return await withRetry(() => submit(roundedPrice));
+    } catch (err) {
+      const message = String(err?.message || '');
+      if (!/tick size|divisible/i.test(message)) throw err;
+
+      const fallbackMode = side === 'LONG' ? 'down' : 'up';
+      const fallbackPrice = this.roundPrice(coin, price, fallbackMode);
+      if (fallbackPrice === roundedPrice) throw err;
+
+      return withRetry(() => submit(fallbackPrice));
+    }
   }
 
   async cancelByCloid(coin, cloid) {
     const { asset } = this.getAssetInfo(coin);
-    return this.exchange.cancelByCloid({
-      cancels: [{ asset, cloid }]
+
+    return withRetry(async () => {
+      return this.exchange.cancelByCloid({
+        cancels: [{ asset, cloid }]
+      });
     });
   }
 
@@ -165,8 +331,13 @@ export class HyperliquidService {
     try {
       return await this.cancelByCloid(coin, cloid);
     } catch (err) {
-      const message = String(err?.message || err || '');
-      if (message.toLowerCase().includes('unknown') || message.toLowerCase().includes('filled')) {
+      const message = String(err?.message || err || '').toLowerCase();
+      if (
+        message.includes('unknown') ||
+        message.includes('filled') ||
+        message.includes('does not exist') ||
+        message.includes('already')
+      ) {
         return null;
       }
       throw err;
