@@ -140,6 +140,8 @@ export class TradeEngine {
 
   async watchPendingEntries() {
     const trades = this.repo.all().filter((t) => t.status === 'PENDING_ENTRY');
+    if (!trades.length) return;
+
     const openOrders = await this.hyperliquid.getOpenOrders();
 
     for (const trade of trades) {
@@ -341,6 +343,8 @@ export class TradeEngine {
   async reconcile() {
     this.pruneSignalHistory();
     const trades = this.repo.all();
+    if (!trades.length) return;
+
     const openOrders = await this.hyperliquid.getOpenOrders();
 
     for (const trade of trades) {

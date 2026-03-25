@@ -25,11 +25,17 @@ async function withRetry(fn, {
   retries = CONFIG.hyperliquid.retryCount,
   baseDelayMs = CONFIG.hyperliquid.retryBaseDelayMs,
   maxDelayMs = CONFIG.hyperliquid.retryMaxDelayMs,
-  shouldRetry = (err) =>
-    err?.code === 'ECONNABORTED' ||
-    err?.code === 'ETIMEDOUT' ||
-    /timeout/i.test(String(err?.message || '')) ||
-    /network/i.test(String(err?.message || ''))
+  shouldRetry = (err) => {
+    const status = Number(err?.response?.status || 0);
+    return (
+      err?.code === 'ECONNABORTED' ||
+      err?.code === 'ETIMEDOUT' ||
+      status === 429 ||
+      status >= 500 ||
+      /timeout/i.test(String(err?.message || '')) ||
+      /network/i.test(String(err?.message || ''))
+    );
+  }
 } = {}) {
   let lastErr;
 
