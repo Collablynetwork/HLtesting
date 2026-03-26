@@ -24,6 +24,23 @@ npm install
 npm start
 ```
 
+## Python SDK Bot
+
+This repo now also includes a Python entrypoint that trades through the official Hyperliquid Python SDK using isolated leverage validation.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-python.txt
+python3 python_autotrader.py
+```
+
+Notes:
+
+- The Python bot reads the existing `.env` in this folder.
+- It is strict about leverage: if a market on your selected environment does not allow the configured `LEVERAGE`, startup will fail with the exchange max leverage instead of sending an invalid request.
+- Do not run the Node bot and Python bot on the same account at the same time.
+
 ## Important env values
 
 ```env
